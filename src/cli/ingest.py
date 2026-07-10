@@ -7,10 +7,9 @@ import concurrent.futures
 
 from src.indexing.router import DocumentRouter
 from src.indexing.indexer import VectorIndexer
-from src.core.config import DATA_DIR, DB_DIR, FAISS_INDEX_PATH, STATE_FILE, DLQ_FILE, EMBEDDING_MODEL
+from src.core.config import DATA_DIR, DB_DIR, STATE_FILE, DLQ_FILE, EMBEDDING_MODEL
 from src.core.logger import setup_logger
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
 
 logger = setup_logger(__name__)
 
@@ -41,9 +40,9 @@ def save_json(filepath: Path, data: dict):
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
 
-def garbage_collection(state: dict, faiss_path: str) -> dict:
+def garbage_collection(state: dict) -> dict:
     """
-    Удаляет из базы FAISS документы, которых больше нет на диске в папке data/.
+    Удаляет из базы Qdrant и doc_store документы, которых больше нет на диске в папке data/.
     Возвращает обновленный state.
     """
     logger.info("=== Этап 0: Сборка мусора (Garbage Collection) ===")
@@ -52,29 +51,41 @@ def garbage_collection(state: dict, faiss_path: str) -> dict:
 
     for filepath_str, info in state.items():
         if not os.path.exists(os.path.join(DATA_DIR, filepath_str)):
-            logger.info(f"Файл {filepath_str} удален с диска. Подготовка к удалению из FAISS.")
+            logger.info(f"Файл {filepath_str} удален с диска. Подготовка к удалению из Qdrant.")
             doc_id = info.get("doc_id")
-            chunk_count = info.get("chunk_count", 0)
-            
-            # Собираем ID всех чанков этого документа
-            for i in range(1, chunk_count + 1):
-                ids_to_delete.append(f"{doc_id}_chunk_{i}")
-                
+            if doc_id:
+                ids_to_delete.append(doc_id)
             deleted_keys.append(filepath_str)
 
     if ids_to_delete:
+        from qdrant_client import QdrantClient
+        from qdrant_client.http import models
+        from src.core.config import QDRANT_URL, QDRANT_COLLECTION, DB_DIR
         try:
-            embeddings = HuggingFaceEmbeddings(
-                model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-                model_kwargs={'device': 'cpu'},
-                encode_kwargs={'normalize_embeddings': True}
-            )
-            vector_store = FAISS.load_local(faiss_path, embeddings, allow_dangerous_deserialization=True)
-            vector_store.delete(ids_to_delete)
-            vector_store.save_local(faiss_path)
-            logger.info(f"Успешно удалено {len(ids_to_delete)} устаревших чанков из FAISS.")
+            # 1. Удаление чанков из Qdrant по метаданным
+            client = QdrantClient(url=QDRANT_URL)
+            if client.collection_exists(QDRANT_COLLECTION):
+                client.delete(
+                    collection_name=QDRANT_COLLECTION,
+                    points_selector=models.Filter(
+                        must=[
+                            models.FieldCondition(
+                                key="metadata.doc_id",
+                                match=models.MatchAny(any=ids_to_delete)
+                            )
+                        ]
+                    )
+                )
+            
+            # 2. Удаление Parent-документов из LocalFileStore
+            from langchain.storage import LocalFileStore
+            from langchain.storage._lc_store import create_kv_docstore
+            store = create_kv_docstore(LocalFileStore(os.path.join(DB_DIR, "doc_store")))
+            store.mdelete(ids_to_delete)
+            
+            logger.info(f"Успешно удалено {len(ids_to_delete)} устаревших документов из Qdrant и doc_store.")
         except Exception as e:
-            logger.error(f"Ошибка при удалении чанков из FAISS: {e}")
+            logger.error(f"Ошибка при удалении документов: {e}")
             return state # В случае ошибки отменяем удаление из state
 
     for key in deleted_keys:
@@ -97,8 +108,7 @@ def run_pipeline():
     dlq = load_json(DLQ_FILE, {})
     
     # 0. Сборка мусора
-    if os.path.exists(FAISS_INDEX_PATH):
-        state = garbage_collection(state, FAISS_INDEX_PATH)
+    state = garbage_collection(state)
     
     router = DocumentRouter()
     docs_to_index = []
@@ -163,7 +173,7 @@ def run_pipeline():
         indexer = VectorIndexer()
         raw_docs = [item[3] for item in docs_to_index]
         
-        doc_chunk_counts = indexer.build_and_save_index(raw_docs, save_path=FAISS_INDEX_PATH)
+        doc_chunk_counts = indexer.build_and_save_index(raw_docs)
         
         if doc_chunk_counts is not None:
             for filename, file_hash, doc_id, _ in docs_to_index:

@@ -1,9 +1,13 @@
 langchain
+langchain-classic
 langchain-community
 langchain-ollama
 langchain-core
+langchain-qdrant
+langchain-experimental
+qdrant-client
+fastembed
 sentence-transformers
-faiss-cpu
 streamlit
 transformers
 PyMuPDF
@@ -12,5 +16,4 @@ beautifulsoup4
 readability-lxml
 requests
 lxml
-rank_bm25
 python-dotenv
