@@ -20,13 +20,15 @@ services:
       - qdrant_data:/qdrant/storage
     restart: unless-stopped
 
-  rag-app:
-    build: .
-    container_name: pharma_rag_ui
+  rag-app-cpu:
+    build:
+      context: .
+      args:
+        USE_GPU: "false"
+    container_name: pharma_rag_ui_cpu
     ports:
       - "8501:8501"
     environment:
-      # Указываем приложению искать Ollama внутри Docker сети
       - OLLAMA_HOST=http://ollama:11434
       - QDRANT_URL=http://qdrant:6333
     volumes:
@@ -39,6 +41,39 @@ services:
       - ollama
       - qdrant
     restart: unless-stopped
+    profiles:
+      - cpu
+
+  rag-app-gpu:
+    build:
+      context: .
+      args:
+        USE_GPU: "true"
+    container_name: pharma_rag_ui_gpu
+    ports:
+      - "8501:8501"
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - QDRANT_URL=http://qdrant:6333
+    volumes:
+      - ./data:/app/data
+      - ./db:/app/db
+      - ./src:/app/src
+      - hf_cache:/root/.cache/huggingface
+      - fastembed_cache:/root/.cache/fastembed
+    depends_on:
+      - ollama
+      - qdrant
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    profiles:
+      - gpu
 
 volumes:
   ollama_data:

@@ -7,8 +7,6 @@ import tempfile
 
 from langchain_ollama import ChatOllama
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 from langchain_core.vectorstores import InMemoryVectorStore
 
@@ -29,7 +27,7 @@ from langchain_community.cache import SQLiteCache
 os.makedirs(DB_DIR, exist_ok=True)
 set_llm_cache(SQLiteCache(database_path=os.path.join(DB_DIR, "langchain_cache.db")))
 
-st.set_page_config(page_title="OmniRAG", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="OmniRAG", layout="wide")
 
 @st.cache_resource(show_spinner=False)
 def get_embeddings():
@@ -111,38 +109,10 @@ def process_temp_files(uploaded_files):
                 st.session_state.temp_files_names.add(uf.name)
 
 # --- Инициализация UI ---
-st.title("🧠 OmniRAG")
+st.title("OmniRAG")
 st.caption("Задайте вопрос, и получите ответ, основанный на реальных данных!")
 
-if "selected_citation" not in st.session_state:
-    st.session_state.selected_citation = None
-
-col_chat, col_viewer = st.columns([6, 4])
-
-# --- Сайдбар (Настройки и Загрузка) ---
-with st.sidebar:
-    st.image("https://cdn-icons-png.flaticon.com/512/2836/2836856.png", width=60)
-    st.title("Управление")
-    
-    st.header("⚙️ Настройки AI")
-    temperature = st.slider("Креативность", 0.0, 1.0, 0.0, 0.1, help="0.0 - строгие факты из базы. 1.0 - больше свободы для нейросети.")
-    top_k = st.slider("Источники (Top K)", 1, 30, 10, 1, help="Сколько фрагментов текста находить в базе.")
-    
-    st.divider()
-    st.header("📄 База знаний (Глобальная)")
-    uploaded_files = st.file_uploader("Загрузить документы", accept_multiple_files=True, type=["pdf", "docx", "txt", "xml", "html"], key="global_uploader")
-    if uploaded_files:
-        if st.button("Индексировать в базу", type="primary"):
-            os.makedirs(DATA_DIR, exist_ok=True)
-            for uf in uploaded_files:
-                with open(os.path.join(DATA_DIR, uf.name), "wb") as f:
-                    f.write(uf.getbuffer())
-            with st.spinner("Идет индексация документов в Qdrant... Это может занять несколько минут."):
-                run_pipeline()
-            st.success("База успешно обновлена!")
-            time.sleep(2)
-            st.rerun()
-
+top_k = 4  # Резко снижаем количество кусков, чтобы маленькая модель не теряла фокус
 with st.spinner("Подключение к базе данных..."):
     main_retriever, status_msg = load_db()
 
@@ -150,105 +120,75 @@ if not main_retriever:
     st.error(status_msg)
     st.stop()
 
-with col_chat:
-    # 3.2 Временные файлы для чата
-    with st.expander("📎 Прикрепить временный файл (Поиск через @filename)"):
-        temp_files = st.file_uploader("Файлы только для текущего сеанса", accept_multiple_files=True, key="temp_uploader")
-        if temp_files:
-            process_temp_files(temp_files)
-            st.success(f"Загружено файлов: {len(st.session_state.temp_files_names)}. Используйте @имя_файла в запросе.")
+# 3.2 Временные файлы для чата
+with st.expander("Прикрепить временный файл"):
+    temp_files = st.file_uploader("Файлы только для текущего сеанса", accept_multiple_files=True, key="temp_uploader")
+    if temp_files:
+        process_temp_files(temp_files)
+        st.success(f"Загружено файлов: {len(st.session_state.temp_files_names)}. Они будут автоматически учтены при ответе.")
 
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-    for msg_idx, msg in enumerate(st.session_state.messages):
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if "citations" in msg and msg["citations"]:
-                st.markdown("**🔍 Источники:**")
-                cols = st.columns(4)
-                for cite_idx, citation in enumerate(msg["citations"]):
-                    with cols[cite_idx % 4]:
-                        if st.button(f"📄 {citation['source']}", key=f"btn_{msg_idx}_{cite_idx}", use_container_width=True):
-                            st.session_state.selected_citation = citation
+for msg_idx, msg in enumerate(st.session_state.messages):
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+if prompt := st.chat_input("Например: Какие побочные эффекты у тренболона?"):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-    if prompt := st.chat_input("Например: Какие побочные эффекты у тренболона? (или @doc.pdf сделай саммари)"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+    with st.chat_message("assistant"):
+        message_placeholder = st.empty()
+        full_response = ""
+        
+        with st.spinner("Анализ базы данных..."):
+            try:
+                # Устанавливаем search_kwargs для глобального ретривера
+                if not hasattr(main_retriever, "search_kwargs") or main_retriever.search_kwargs is None:
+                    main_retriever.search_kwargs = {}
+                main_retriever.search_kwargs.update({'k': top_k * 3})
 
-        with st.chat_message("assistant"):
-            message_placeholder = st.empty()
-            full_response = ""
-            citations = []
-            seen_sources = set()
-            
-            with st.spinner("Анализ базы данных..."):
-                try:
-                    # Проверяем наличие @filename в запросе
-                    tag_match = re.search(r'@([\w.-]+)', prompt)
-                    
-                    if tag_match and "temp_vectorstore" in st.session_state:
-                        # Поиск ТОЛЬКО по временному файлу
-                        target_file = tag_match.group(1)
-                        def filter_by_source(doc):
-                            return doc.metadata.get("source") == target_file
-                            
-                        # InMemoryVectorStore filter requires callable or exact matching depending on version.
-                        # Simple way: get retriever with filtering logic
-                        temp_retriever = st.session_state.temp_vectorstore.as_retriever(
-                            search_kwargs={'k': top_k, 'filter': filter_by_source}
-                        )
-                        active_retriever = temp_retriever
+                if "temp_vectorstore" in st.session_state and st.session_state.temp_files_names:
+                    from langchain_classic.retrievers import MergerRetriever
+                    temp_retriever = st.session_state.temp_vectorstore.as_retriever(
+                        search_kwargs={'k': top_k * 3}
+                    )
+                    active_retriever = MergerRetriever(retrievers=[main_retriever, temp_retriever])
+                else:
+                    active_retriever = main_retriever
+
+                # Собираем chain на лету с активным ретривером
+                rag_chain, _ = build_rag_chain(active_retriever, top_k)
+
+                chat_history = []
+                # Ограничиваем историю только последними 2 сообщениями (1 пара вопрос-ответ)
+                for msg in st.session_state.messages[-3:-1]: 
+                    if msg["role"] == "user":
+                        chat_history.append(("human", msg["content"]))
                     else:
-                        active_retriever = main_retriever
-
-                    # Собираем chain на лету с активным ретривером
-                    rag_chain, _ = build_rag_chain(active_retriever, top_k, temperature)
-
-                    chat_history = []
-                    for msg in st.session_state.messages[:-1]: 
-                        if msg["role"] == "user":
-                            chat_history.append(("human", msg["content"]))
-                        else:
-                            chat_history.append(("ai", msg["content"]))
+                        chat_history.append(("ai", msg["content"]))
+                        
+                last_update_time = time.time()
+                UPDATE_INTERVAL = 0.1
+                
+                for chunk in rag_chain.stream({"input": prompt, "chat_history": chat_history}):
+                    if "answer" in chunk:
+                        full_response += chunk["answer"]
+                        if time.time() - last_update_time > UPDATE_INTERVAL:
+                            message_placeholder.markdown(full_response + "▌")
+                            last_update_time = time.time()
                             
-                    last_update_time = time.time()
-                    UPDATE_INTERVAL = 0.1
-                    
-                    for chunk in rag_chain.stream({"input": prompt, "chat_history": chat_history}):
-                        if "answer" in chunk:
-                            full_response += chunk["answer"]
-                            if time.time() - last_update_time > UPDATE_INTERVAL:
-                                message_placeholder.markdown(full_response + "▌")
-                                last_update_time = time.time()
-                            
-                        if "context" in chunk:
-                            for doc in chunk["context"]:
-                                source = doc.metadata.get("source", "Неизвестный источник")
-                                content_hash = hash(doc.page_content)
-                                if content_hash not in seen_sources:
-                                    citations.append({
-                                        "source": source,
-                                        "content": doc.page_content
-                                    })
-                                    seen_sources.add(content_hash)
-                                
-                    message_placeholder.markdown(full_response)
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": full_response,
-                        "citations": citations
-                    })
-                    st.rerun()
-                    
-                except Exception as e:
-                    st.error(f"Произошла ошибка при генерации ответа: {e}")
+                message_placeholder.markdown(full_response)
+                
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": full_response
+                })
+                st.rerun()
+                
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                st.error(f"Произошла ошибка при генерации ответа: {e}")
 
-with col_viewer:
-    st.subheader("📖 Просмотр источника")
-    if st.session_state.selected_citation:
-        st.markdown(f"**Источник:** `{st.session_state.selected_citation['source']}`")
-        st.info(st.session_state.selected_citation['content'])
-    else:
-        st.info("👈 Нажмите на любой источник в чате, чтобы прочитать точную цитату, из которой нейросеть взяла информацию.")
