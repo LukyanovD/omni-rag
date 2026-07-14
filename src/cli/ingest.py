@@ -77,13 +77,7 @@ def garbage_collection(state: dict) -> dict:
                     )
                 )
             
-            # 2. Удаление Parent-документов из LocalFileStore
-            from langchain.storage import LocalFileStore
-            from langchain.storage._lc_store import create_kv_docstore
-            store = create_kv_docstore(LocalFileStore(os.path.join(DB_DIR, "doc_store")))
-            store.mdelete(ids_to_delete)
-            
-            logger.info(f"Успешно удалено {len(ids_to_delete)} устаревших документов из Qdrant и doc_store.")
+            logger.info(f"Успешно удалено {len(ids_to_delete)} устаревших документов из Qdrant.")
         except Exception as e:
             logger.error(f"Ошибка при удалении документов: {e}")
             return state # В случае ошибки отменяем удаление из state

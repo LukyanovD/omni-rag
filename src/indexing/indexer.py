@@ -9,12 +9,8 @@ try:
     from langchain_text_splitters import RecursiveCharacterTextSplitter
     from langchain_core.documents import Document
     from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain_experimental.text_splitter import SemanticChunker
     from langchain_qdrant import QdrantVectorStore, FastEmbedSparse, RetrievalMode
     from qdrant_client import QdrantClient
-    from langchain_classic.retrievers import ParentDocumentRetriever
-    from langchain_classic.storage import LocalFileStore
-    from langchain_classic.storage._lc_store import create_kv_docstore
 except ImportError:
     pass
 
@@ -23,8 +19,7 @@ logger = setup_logger(__name__)
 class VectorIndexer:
     """
     Класс для токен-чанкинга нормализованных документов и их векторизации 
-    с сохранением в локальную базу данных Qdrant (Hybrid Search)
-    и использованием ParentDocumentRetriever.
+    с сохранением в локальную базу данных Qdrant (Hybrid Search).
     """
     def __init__(self):
         self.model_name = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -41,12 +36,8 @@ class VectorIndexer:
         
         self.qdrant_client = QdrantClient(url=QDRANT_URL)
         
-        self.fs = LocalFileStore(os.path.join(DB_DIR, "doc_store"))
-        self.store = create_kv_docstore(self.fs)
-        
-        # Parent/Child Splitters (Small-to-Big Retrieval)
-        self.parent_splitter = RecursiveCharacterTextSplitter(chunk_size=2000, chunk_overlap=200)
-        self.child_splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
+        # Сплиттер для чанков
+        self.splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=150)
 
     def _protect_tables(self, text: str) -> str:
         """Предварительная обработка Markdown таблиц."""
@@ -81,13 +72,22 @@ class VectorIndexer:
             metadata.pop("_id", None)
             doc_id = d.get("id", "unknown_id")
             metadata["doc_id"] = doc_id
+            
+            source_file = metadata.get("source", "Неизвестный документ")
+            filename = os.path.basename(source_file)
+            
             if text:
-                langchain_docs.append(Document(page_content=text, metadata=metadata))
+                doc = Document(page_content=text, metadata=metadata)
+                chunks = self.splitter.split_documents([doc])
+                
+                for chunk in chunks:
+                    chunk.page_content = f"[Источник: {filename}]\n{chunk.page_content}"
+                    langchain_docs.append(chunk)
 
         if not langchain_docs:
             return None
 
-        logger.info(f"Векторизация {len(langchain_docs)} документов через ParentDocumentRetriever...")
+        logger.info(f"Векторизация {len(langchain_docs)} чанков напрямую в Qdrant...")
         
         try:
             if not self.qdrant_client.collection_exists(QDRANT_COLLECTION):
@@ -111,20 +111,17 @@ class VectorIndexer:
                 retrieval_mode=RetrievalMode.HYBRID
             )
 
-            retriever = ParentDocumentRetriever(
-                vectorstore=vector_store,
-                docstore=self.store,
-                child_splitter=self.child_splitter,
-                parent_splitter=self.parent_splitter,
-            )
-
-            doc_ids = [d.metadata["doc_id"] for d in langchain_docs]
-            retriever.add_documents(langchain_docs)
+            vector_store.add_documents(langchain_docs)
             
-            logger.info("Документы успешно добавлены в Qdrant и doc_store.")
+            logger.info("Чанки успешно добавлены в Qdrant.")
             
-            # Возвращаем dummy dict для совместимости с ingest.py
-            return {d_id: 1 for d_id in doc_ids}
+            doc_chunk_counts = {}
+            for chunk in langchain_docs:
+                d_id = chunk.metadata.get("doc_id")
+                if d_id:
+                    doc_chunk_counts[d_id] = doc_chunk_counts.get(d_id, 0) + 1
+                    
+            return doc_chunk_counts
                 
         except Exception as e:
             import traceback

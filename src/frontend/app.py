@@ -60,19 +60,7 @@ def load_db():
             retrieval_mode=RetrievalMode.HYBRID
         )
         
-        from langchain_classic.retrievers import ParentDocumentRetriever
-        from langchain_classic.storage import LocalFileStore
-        from langchain_classic.storage._lc_store import create_kv_docstore
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
-        
-        store = create_kv_docstore(LocalFileStore(os.path.join(DB_DIR, "doc_store")))
-        
-        retriever = ParentDocumentRetriever(
-            vectorstore=vector_store,
-            docstore=store,
-            child_splitter=RecursiveCharacterTextSplitter(chunk_size=250),
-            parent_splitter=RecursiveCharacterTextSplitter(chunk_size=2000),
-        )
+        retriever = vector_store.as_retriever(search_kwargs={"k": 15})
         
         return retriever, "Success"
     except Exception as e:
@@ -113,6 +101,7 @@ st.title("OmniRAG")
 st.caption("Задайте вопрос, и получите ответ, основанный на реальных данных!")
 
 top_k = 4  # Резко снижаем количество кусков, чтобы маленькая модель не теряла фокус
+fetch_k = 15 # Количество кусков для извлечения из векторной базы перед реренкингом
 with st.spinner("Подключение к базе данных..."):
     main_retriever, status_msg = load_db()
 
@@ -147,16 +136,23 @@ if prompt := st.chat_input("Например: Какие побочные эфф
                 # Устанавливаем search_kwargs для глобального ретривера
                 if not hasattr(main_retriever, "search_kwargs") or main_retriever.search_kwargs is None:
                     main_retriever.search_kwargs = {}
-                main_retriever.search_kwargs.update({'k': top_k * 3})
+                main_retriever.search_kwargs.update({'k': fetch_k})
 
                 if "temp_vectorstore" in st.session_state and st.session_state.temp_files_names:
                     from langchain_classic.retrievers import MergerRetriever
                     temp_retriever = st.session_state.temp_vectorstore.as_retriever(
-                        search_kwargs={'k': top_k * 3}
+                        search_kwargs={'k': fetch_k}
                     )
                     active_retriever = MergerRetriever(retrievers=[main_retriever, temp_retriever])
                 else:
                     active_retriever = main_retriever
+
+                # Debug print to console
+                print(f"--- DEBUG: USER PROMPT: {prompt} ---")
+                retrieved_docs = active_retriever.invoke(prompt)
+                print(f"--- DEBUG: RETRIEVED DOCS ({len(retrieved_docs)}) ---")
+                for d in retrieved_docs:
+                    print(d.page_content[:200])
 
                 # Собираем chain на лету с активным ретривером
                 rag_chain, _ = build_rag_chain(active_retriever, top_k)
